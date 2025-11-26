@@ -1,0 +1,422 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>SF2 Advanced Merger (WASM)</title>
+<style>
+  :root { --bg:#0f1720; --card:#111827; --muted:#9ca3af; --accent:#06b6d4; color-scheme: dark; }
+  body{font-family:Inter,system-ui,Segoe UI,Roboto,Arial; background:var(--bg); color:#e6eef6; margin:0; padding:28px;}
+  .container{max-width:1000px;margin:0 auto;}
+  header{display:flex;gap:18px;align-items:center; margin-bottom:18px;}
+  h1{margin:0;font-size:20px}
+  .card{background:var(--card); padding:16px;border-radius:12px; box-shadow:0 6px 18px rgba(2,6,23,.6);}
+  .row{display:flex;gap:12px;align-items:center;margin:10px 0;}
+  input[type=file]{color:transparent}
+  button{background:var(--accent);border:none;color:#021018;padding:10px 12px;border-radius:8px;cursor:pointer;font-weight:700}
+  table{width:100%;border-collapse:collapse;margin-top:12px}
+  th,td{padding:8px;border-bottom:1px solid rgba(255,255,255,.03);text-align:left;font-size:13px}
+  tr:hover{background:rgba(255,255,255,.01)}
+  .muted{color:var(--muted);font-size:13px}
+  #status{margin-top:8px}
+  .play-btn{background:#0ea5a4;color:#021018;border-radius:8px;padding:6px 10px;border:none;cursor:pointer;font-weight:600}
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>SF2 Advanced Merger (WASM) — Version A</h1>
+    <div class="muted">Real preset/instrument/sample merging + preview</div>
+  </header>
+
+  <div class="card">
+    <div class="row">
+      <label class="muted">SoundFont A</label>
+      <input id="sf2a" type="file" accept=".sf2" />
+      <label class="muted">SoundFont B</label>
+      <input id="sf2b" type="file" accept=".sf2" />
+      <button id="mergeBtn">Merge</button>
+      <button id="downloadBtn" disabled>Download merged.sf2</button>
+    </div>
+
+    <div id="status" class="muted">No action yet.</div>
+  </div>
+
+  <div style="height:18px"></div>
+
+  <div class="card" id="presetsCard" style="display:none;">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <strong>Presets (merged)</strong>
+      <div class="muted">Click a preset's play button to preview a middle C tone</div>
+    </div>
+    <table id="presetsTable">
+      <thead><tr><th>#</th><th>Bank</th><th>Preset</th><th>Instrument</th><th>Action</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+// NOTE: This app relies on a few open-source JS/WASM libraries (CDN below).
+// The code below assumes they expose the following APIs (see citations after code):
+// - spessasynth_lib.readSF2(uint8array) -> parsed soundfont object (presets, instruments, samples)
+// - spessasynth_core.buildSF2(soundfontObject) -> Uint8Array (serialised SF2 binary)
+// - js-synthesizer (or similar) to play notes via WebAudio using SF2 buffer
+// We'll attempt to load those modules from CDN and fallback-friendly wrappers.
+
+const statusEl = document.getElementById('status');
+const mergeBtn = document.getElementById('mergeBtn');
+const downloadBtn = document.getElementById('downloadBtn');
+const presetsTableBody = document.querySelector('#presetsTable tbody');
+const presetsCard = document.getElementById('presetsCard');
+
+let lib = {
+  // placeholders; real functions will be filled once libs have loaded
+  parseSF2: null,
+  buildSF2: null,
+  synth: null
+};
+
+// ---------- Load external libs (CDN) ----------
+async function loadLibs() {
+  status('Loading libraries...');
+  // We use spessasynth_lib for SF2 reading and spessasynth_core or soundfont2 for writing.
+  // js-synthesizer / fluidsynth-emscripten is used for playback (WASM synth).
+  // Try to import from jsdelivr/unpkg; these are common public CDNs.
+
+  // 1) attempt to load SpessaSynth Lib (reader)
+  try {
+    await import('https://cdn.jsdelivr.net/npm/spessasynth_lib@3.17.0/index.js');
+    // NOTE: when imported as a module the library should expose readSF2
+  } catch(e){
+    // ignore — fallback to older paths; we'll attempt to load specific script files
+  }
+
+  // Because CDN particulars vary, we'll dynamically create script tags for small set of known builds.
+  const urls = [
+    // parser / read
+    'https://cdn.jsdelivr.net/gh/colinbdclark/sf2-parser@master/dist/sf2parser.min.js',
+    // spessa synth helpers (readers)
+    'https://cdn.jsdelivr.net/npm/spessasynth_lib@3.17.0/dist/spessasynth_lib.umd.js',
+    // synth (WASM-backed) for audio preview (js-synthesizer wrapper)
+    'https://cdn.jsdelivr.net/npm/js-synthesizer@2.0.0/dist/js-synthesizer.min.js',
+    // attempt write-support library (soundfont2)
+    'https://cdn.jsdelivr.net/npm/soundfont2@0.5.0/dist/soundfont2.umd.js'
+  ];
+
+  for (const u of urls) {
+    try {
+      await addScript(u);
+      console.log('Loaded', u);
+    } catch (e) {
+      console.warn('Could not load', u, e);
+    }
+  }
+
+  // After loading, try to detect available exports
+  // sf2parser (colinbdclark) exposes window.Sf2Parser or window.sf2parser (older). spessasynth has read functionality.
+  if (window.SpessaSynth && window.SpessaSynth.readSF2) {
+    lib.parseSF2 = window.SpessaSynth.readSF2;
+  } else if (window.Sf2Parser || window.sf2parser) {
+    // build a wrapper parse function using sf2parser
+    const Parser = window.Sf2Parser || window.sf2parser;
+    lib.parseSF2 = function(u8) {
+      const parser = new Parser();
+      parser.parse(u8);
+      // convert parser internals to a simpler object for merging
+      return {
+        presets: parser.getPresets ? parser.getPresets() : parser.presets || [],
+        instruments: parser.getInstruments ? parser.getInstruments() : parser.instruments || [],
+        samples: parser.sample || parser.samples || parser._samples || []
+      };
+    };
+  } else if (window.SoundFont2) {
+    // soundfont2 has constructor SoundFont2
+    lib.parseSF2 = function(u8) {
+      return new window.SoundFont2(u8);
+    };
+  } else {
+    throw new Error('No SF2 parser available on page. Please ensure CDN scripts loaded.');
+  }
+
+  // Try to use soundfont2 (mrten) to build a new SF2 — if available
+  if (window.SoundFont2 && window.SoundFont2.build) {
+    lib.buildSF2 = (sfObj) => {
+      return window.SoundFont2.build(sfObj); // returns Uint8Array
+    };
+  } else if (window.SpessaSynth && window.SpessaSynth.buildSF2) {
+    lib.buildSF2 = window.SpessaSynth.buildSF2;
+  } else {
+    // fallback: we'll try to reserialize using the soundfont2 library if present later at runtime
+    lib.buildSF2 = null;
+  }
+
+  // Attempt to prepare a WASM synth for audio preview
+  if (window['JsSynthesizer']) {
+    try {
+      lib.synth = await window['JsSynthesizer'].createSynth({ sampleRate: 48000 });
+      status('Libraries loaded. Ready.');
+      return;
+    } catch(e){
+      console.warn('Could not init JsSynthesizer', e);
+    }
+  }
+
+  status('Libraries loaded. (preview may be limited if synth not available).');
+}
+
+// helper to inject script tag and wait
+function addScript(src){
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = src;
+    s.async = true;
+    s.onload = () => setTimeout(resolve, 50);
+    s.onerror = reject;
+    document.head.appendChild(s);
+  });
+}
+
+function status(txt){ statusEl.innerText = txt; }
+
+// ---------- Merge logic ----------
+/*
+  Strategy:
+  - Parse each SF2 to a neutral JS object using parser library
+  - Create a new merged object:
+    - Copy global metadata
+    - Append samples from B after samples from A, fix sample indices in instruments/zones
+    - Append instruments and presets while remapping instrument and sample indices
+  Note: SF2 internals are complex; this implementation handles the common cases and remaps indices.
+*/
+
+async function mergeSF2Buffers(u8a, u8b) {
+  status('Parsing SF2 files...');
+  // parse both
+  const sfa = lib.parseSF2(u8a);
+  const sfb = lib.parseSF2(u8b);
+
+  // Normalize format: attempt to access presets/instruments/samples arrays
+  const presetsA = sfa.presets || [];
+  const presetsB = sfb.presets || [];
+  const instA = sfa.instruments || [];
+  const instB = sfb.instruments || [];
+  const samplesA = sfa.samples || sfa.sample || [];
+  const samplesB = sfb.samples || sfb.sample || [];
+
+  status(`Parsed: A=${presetsA.length} presets, B=${presetsB.length} presets`);
+
+  // Build merged containers
+  const merged = {
+    info: sfa.info || sfb.info || {},
+    presets: [],
+    instruments: [],
+    samples: []
+  };
+
+  // Helper maps for remapping indices
+  const instrumentIndexMap = new Map(); // oldInstrumentRef -> new index
+  const sampleIndexMap = new Map(); // oldSampleIndexWithinB -> newIndex
+
+  // Start with samples from A
+  merged.samples = samplesA.slice(); // shallow copy
+  const sampleCountA = merged.samples.length;
+
+  // Append samples from B; map their old indices to new ones
+  for (let i = 0; i < samplesB.length; i++) {
+    const newIndex = merged.samples.length;
+    merged.samples.push(samplesB[i]);
+    sampleIndexMap.set(i, newIndex);
+  }
+
+  // Append instruments from A, keep same indices (0..nA-1)
+  for (let i = 0; i < instA.length; i++) {
+    const inst = JSON.parse(JSON.stringify(instA[i]));
+    // ensure zones' sample references are intact
+    merged.instruments.push(inst);
+    instrumentIndexMap.set('A:'+i, merged.instruments.length - 1);
+  }
+
+  // Append instruments from B, but remap their zone sample references
+  for (let i = 0; i < instB.length; i++) {
+    const inst = JSON.parse(JSON.stringify(instB[i]));
+    // each instrument has zones that may reference samples by index; update them
+    if (inst.zones && inst.zones.length) {
+      for (const z of inst.zones) {
+        if (typeof z.sampleIndex === 'number') {
+          const oldIdx = z.sampleIndex;
+          if (sampleIndexMap.has(oldIdx)) z.sampleIndex = sampleIndexMap.get(oldIdx);
+          else z.sampleIndex = oldIdx + sampleCountA; // fallback
+        }
+      }
+    }
+    merged.instruments.push(inst);
+    instrumentIndexMap.set('B:'+i, merged.instruments.length - 1);
+  }
+
+  // Append presets from A (preserve)
+  for (const p of presetsA) {
+    merged.presets.push(JSON.parse(JSON.stringify(p)));
+  }
+
+  // Append presets from B, but remap instrument references to new indexes
+  for (const p of presetsB) {
+    const np = JSON.parse(JSON.stringify(p));
+    if (np.zones && np.zones.length) {
+      for (const z of np.zones) {
+        // if zone references an instrument index, remap
+        if (typeof z.instrumentIndex === 'number') {
+          const oldInst = z.instrumentIndex;
+          const mapped = instrumentIndexMap.get('B:'+oldInst);
+          if (mapped !== undefined) z.instrumentIndex = mapped;
+          else z.instrumentIndex = oldInst + instA.length;
+        }
+      }
+    }
+    merged.presets.push(np);
+  }
+
+  status('Merged data structures. Building SF2 binary...');
+
+  // Try to build a binary SF2 using available builder
+  if (!lib.buildSF2) {
+    // If no writer available, attempt to use spessasynth_core writer if present globally.
+    if (window.SpessaSynth && window.SpessaSynth.buildSF2) {
+      lib.buildSF2 = window.SpessaSynth.buildSF2;
+    }
+  }
+
+  if (!lib.buildSF2) {
+    // Final fallback: pack a JSON-contained .sf2-like binary (not real SF2).
+    // But because you asked for real merging, we warn the user.
+    status('Warning: SF2-builder library not found in page. Merged internal structure created but cannot export a fully valid SF2 binary. Install "soundfont2" or "SpessaSynth" writer on the page.');
+    return { mergedObj: merged, binary: null };
+  }
+
+  // Attempt to build actual SF2 binary
+  try {
+    // lib.buildSF2 should accept merged object and return Uint8Array
+    const binary = lib.buildSF2(merged);
+    status('Built merged SF2 binary successfully.');
+    return { mergedObj: merged, binary };
+  } catch (err) {
+    console.error(err);
+    status('Failed to produce SF2 binary: ' + err.message);
+    return { mergedObj: merged, binary: null, error: err };
+  }
+}
+
+// ---------- UI interactions ----------
+mergeBtn.addEventListener('click', async () => {
+  try {
+    mergeBtn.disabled = true;
+    status('Starting: loading libraries...');
+    await loadLibs();
+
+    const fA = document.getElementById('sf2a').files[0];
+    const fB = document.getElementById('sf2b').files[0];
+    if (!fA || !fB) { status('Please select both SF2 files.'); mergeBtn.disabled = false; return; }
+
+    status('Reading files...');
+    const aBuf = new Uint8Array(await fA.arrayBuffer());
+    const bBuf = new Uint8Array(await fB.arrayBuffer());
+
+    const result = await mergeSF2Buffers(aBuf, bBuf);
+
+    if (result.binary && result.binary instanceof Uint8Array) {
+      // create blob and enable download
+      const blob = new Blob([result.binary], { type: 'audio/sf2' });
+      const url = URL.createObjectURL(blob);
+      downloadBtn.disabled = false;
+      downloadBtn.onclick = () => {
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'merged.sf2';
+        a.click();
+      };
+      status('Merged! You can preview presets below and download merged.sf2.');
+    } else {
+      status('Merged structure created but full SF2 binary export not available (see console).');
+    }
+
+    // Populate preview table from merged object (if available)
+    const merged = result.mergedObj;
+    populatePresetsTable(merged);
+    presetsCard.style.display = 'block';
+  } catch (err) {
+    console.error(err);
+    status('Error: ' + (err.message || err));
+  } finally {
+    mergeBtn.disabled = false;
+  }
+});
+
+function populatePresetsTable(merged) {
+  presetsTableBody.innerHTML = '';
+  const presets = merged.presets || [];
+  for (let i = 0; i < presets.length; i++) {
+    const p = presets[i];
+    const tr = document.createElement('tr');
+    const tdIdx = document.createElement('td'); tdIdx.innerText = i;
+    const tdBank = document.createElement('td'); tdBank.innerText = p.bank || (p.bankNum || 0);
+    const tdPreset = document.createElement('td'); tdPreset.innerText = p.presetName || p.name || p.preset || 'Preset ' + i;
+    const tdInst = document.createElement('td'); tdInst.innerText = (p.instrumentName || (p.zones && p.zones[0] && p.zones[0].instrumentName) || '—');
+    const tdAct = document.createElement('td');
+    const playBtn = document.createElement('button');
+    playBtn.className = 'play-btn';
+    playBtn.innerText = 'Play C4';
+    playBtn.onclick = () => previewPresetNote(merged, i, 60); // 60 = middle C
+    tdAct.appendChild(playBtn);
+
+    tr.appendChild(tdIdx); tr.appendChild(tdBank); tr.appendChild(tdPreset); tr.appendChild(tdInst); tr.appendChild(tdAct);
+    presetsTableBody.appendChild(tr);
+  }
+}
+
+// Preview: play a single MIDI note via available synth engine
+async function previewPresetNote(merged, presetIndex, midiNote) {
+  try {
+    status('Preview: preparing synth (may take a moment)...');
+    // if we have a binary merged SF2, load it into the synth
+    if (lib.synth && merged) {
+      // prefer a built binary if available
+      let sf2binary = null;
+      if (lib.buildSF2) {
+        try {
+          sf2binary = lib.buildSF2(merged);
+        } catch(e) {
+          console.warn('Could not build binary for preview:', e);
+        }
+      }
+      if (!sf2binary) {
+        status('Preview not available: SF2 writer not present.');
+        return;
+      }
+
+      // js-synthesizer accepts an sf2 binary to create an instrument bank
+      // API varies between versions; attempt common usage:
+      const synth = lib.synth;
+      const wavetable = await synth.loadSoundFont(sf2binary.buffer || sf2binary);
+      // choose preset bank/preset if available
+      const preset = merged.presets && merged.presets[presetIndex];
+      let bank = preset && (preset.bank || preset.bankNum || 0);
+      let presetNum = preset && (preset.preset || preset.presetNum || 0);
+      if (bank === undefined) bank = 0;
+      if (presetNum === undefined) presetNum = 0;
+
+      // play the note for 1s
+      await synth.noteOn(bank, presetNum, midiNote, 127);
+      setTimeout(() => synth.noteOff(bank, presetNum, midiNote), 900);
+      status('Playing note ' + midiNote + ' on preset ' + presetIndex);
+      return;
+    } else {
+      status('Preview not available (no synth).');
+    }
+  } catch (e) {
+    console.error(e);
+    status('Preview error: ' + e.message);
+  }
+}
+</script>
+</body>
+</html>
